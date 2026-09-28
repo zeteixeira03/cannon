@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 GRAVITY = 9.81          # m/s²
 DT = 0.02               # s, integration timestep
-N_STEPS = 400           # timesteps per flight (8 s)
+N_STEPS = 400           # timesteps per flight (400 x 0.02s = 8 s)
 CANNON_POS = (0.0, 0.0)
 
 MAX_SPEED = 45.0        # m/s
@@ -20,7 +20,7 @@ def to_launch(raw):
     """Map unconstrained params ``raw = [raw_angle, raw_speed]`` to physical ``(angle, speed)``.
 
     A sigmoid squashes each value into ``(0, MAX_ANGLE)`` and ``(0, MAX_SPEED)``, so the
-    optimiser can move ``raw`` freely without ever producing an invalid launch.
+    optimiser can move ``raw`` freely without ever producing invalid physics.
     """
     raw_angle, raw_speed = raw
     return MAX_ANGLE * jax.nn.sigmoid(raw_angle), MAX_SPEED * jax.nn.sigmoid(raw_speed)
@@ -35,7 +35,7 @@ def launch_to_raw(angle, speed):
 
 
 def initial_state(raw):
-    """``(pos, vel)`` at the muzzle for launch params ``raw``."""
+    """``(pos, vel)`` at ``t = 0`` for launch params ``raw``."""
     angle, speed = to_launch(raw)
     pos = jnp.array(CANNON_POS)
     vel = speed * jnp.array([jnp.cos(angle), jnp.sin(angle)])
@@ -47,17 +47,16 @@ def acceleration(vel, drag):
 
     ``drag`` is ``k = ρ·C_d·A / (2m)`` in 1/m; terminal speed is ``sqrt(GRAVITY / k)``.
     """
-    # TODO(you): tests/test_physics.py::test_acceleration
-    raise NotImplementedError
+    speed = jnp.linalg.norm(vel)
+    air_acc = -drag * speed * vel
+    return jnp.array([0.0, -GRAVITY]) + air_acc
 
 
 def step(state, drag):
-    """Advance ``(pos, vel)`` by one timestep of ``DT`` under :func:`acceleration`."""
-    # TODO(you): with drag the acceleration depends on velocity, so the old constant-acceleration
-    # update is no longer exact. Forward Euler is off by 0.2-0.6 m after 4 s; the test wants < 1 cm.
-    # Pick a higher-order scheme (midpoint/RK2 or RK4). With drag = 0 it must still give the
-    # analytic range. Tests: tests/test_physics.py -k "range or drag"
-    raise NotImplementedError
+    """Advance ``(pos, vel)`` by one timestep of ``DT`` (RK2 midpoint)."""
+    pos, vel = state
+    vel_mid = vel + 0.5 * DT * acceleration(vel, drag)
+    return pos + DT * vel_mid, vel + DT * acceleration(vel_mid, drag)
 
 
 def simulate(raw, drag=0.0):
