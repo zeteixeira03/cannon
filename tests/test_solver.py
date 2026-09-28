@@ -51,7 +51,7 @@ def test_closest_approach_static_target_off_the_path():
     target = traj[100] + jnp.array([0.0, 3.0])
     d2, _ = closest_approach(traj, jnp.broadcast_to(target, traj.shape))
     geometric = jnp.min(jax.vmap(point_segment_sq_dist, in_axes=(0, 0, None))(traj[:-1], traj[1:], target))
-    assert jnp.allclose(d2, geometric, rtol=1e-4)                # a static target reduces to the old loss
+    assert jnp.allclose(d2, geometric, rtol=1e-4)                # a static target: plain distance to the path
 
 
 def test_closest_approach_moving_target_on_time():
@@ -77,7 +77,7 @@ def test_wall_penalty_counts_only_the_flight_before_impact():
 
 def test_wall_counts_for_a_target_that_starts_before_it():
     # The target starts left of the wall but is hit to the right of it: the ball goes through
-    # the wall, so the penalty must count. (A "wall left of the target" rule would miss this.)
+    # the wall, so the penalty must count.
     traj = low_shot()
     i = int(jnp.argmax(traj[:, 0] > 45.0))
     scene = make_scene(target=(20.0, 0.0), target_vel=((traj[i, 0] - 20.0) / TIMES[i], traj[i, 1] / TIMES[i]),

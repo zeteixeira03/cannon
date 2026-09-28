@@ -73,7 +73,7 @@ cannon/physics.py   launch parametrisation, simulation
 cannon/solver.py    losses, Adam, batched two-phase solve
 cannon/game.py      matplotlib UI
 tests/              pytest suite
-learning/           earlier exercises this grew out of (not part of the game)
+learning/           standalone JAX exercises (not part of the game)
 ```
 
 ## Roadmap
