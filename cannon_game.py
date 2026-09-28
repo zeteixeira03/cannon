@@ -439,8 +439,26 @@ def solve_shot(raw0_batch, target, wall):
     a batched, compiled program (under vmap even jax.lax.cond becomes
     "compute both, then select").
     """
-    # TODO
-    raise NotImplementedError
+    no_wall = wall.at[3].set(0.0)  # disable the wall for phase 1
+    free_final, free_hist, free_loss = solve_arcs(raw0_batch, target, no_wall)
+
+    # check which arcs go through the real wall
+    free_traj = jax.vmap(simulate)(free_final)
+    penalties = jax.vmap(wall_penalty, in_axes=(0, None, None))(free_traj, target, wall)
+    blocked = penalties > 1e-6
+
+    # phase 2: warm start from phase 1's answers, wall ON
+    wall_final, wall_hist, wall_loss = solve_arcs(free_final, target, wall)
+
+    # choose per arc whether to keep the free arc or use the wall arc
+    final = jnp.where(blocked[:, None], wall_final, free_final)
+    second_half_hist = jnp.where(blocked[:, None, None], wall_hist, free_final[:, None, :])
+    second_half_loss = jnp.where(blocked[:, None], wall_loss, free_loss[:, -1:])
+    
+    raw_history = jnp.concatenate([free_hist, second_half_hist], axis=1)
+    loss_history = jnp.concatenate([free_loss, second_half_loss], axis=1)
+
+    return final, raw_history, loss_history
 
 
 # ===========================================================================
