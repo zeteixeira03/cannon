@@ -12,7 +12,7 @@ DT = 0.02               # s, integration timestep
 N_STEPS = 400           # timesteps per flight (400 x 0.02s = 8 s)
 CANNON_POS = (0.0, 0.0)
 
-MAX_SPEED = 45.0        # m/s
+MAX_SPEED = 100.0       # m/s; reaches the edge of the view under heavy drag
 MAX_ANGLE = jnp.pi / 2  # rad
 
 
