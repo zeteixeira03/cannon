@@ -3,12 +3,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from cannon.game import analyse_shot, choose_arc
-from cannon.physics import DT, N_STEPS, launch_to_raw, simulate
-from cannon.solver import (INITIAL_GUESSES, LEARNING_RATE, N_ITERS, adam_init, adam_update, closest_approach,
-                           initial_raw_batch, loss_fn, make_scene, optimise_batch, point_segment_sq_dist, solve,
+from cannon.physics import DT, N_STEPS, launch_to_raw, simulate, to_launch
+from cannon.solver import (LEARNING_RATE, N_ARCS, N_ITERS, adam_init, adam_update, closest_approach,
+                           initial_guesses, loss_fn, make_scene, optimise_batch, point_segment_sq_dist, solve,
                            target_path, wall_penalty)
 
-N = len(INITIAL_GUESSES)
+N = N_ARCS
 WALL = jnp.array([30.0, 2.0, 15.0, 1.0])
 TIMES = DT * jnp.arange(1, N_STEPS + 1)
 
@@ -101,9 +101,25 @@ def test_adam_first_step_is_lr_for_every_param():
     assert jnp.allclose(jnp.abs(new_raw - raw), LEARNING_RATE, rtol=1e-3)
 
 
+def test_initial_guesses_are_the_two_drag_free_arcs():
+    scene = make_scene((70.0, 10.0))
+    raw = initial_guesses(scene)
+    assert raw.shape == (N_ARCS, 2)
+    angles = [float(to_launch(r)[0]) for r in raw]
+    assert angles[0] < np.pi / 4 < angles[1]                     # one flat, one lobbed
+    assert all(loss_fn(r, scene) < 1e-3 for r in raw)            # both already hit without drag
+
+
+def test_initial_guesses_land_inside_the_simulated_window():
+    for x in range(5, 126, 10):                                  # the whole view
+        for y in range(0, 51, 10):
+            scene = make_scene((float(x), float(y)))
+            assert all(loss_fn(r, scene) < 1e-2 for r in initial_guesses(scene)), (x, y)
+
+
 def test_optimise_batch_converges():
     scene = make_scene((40.0, 5.0))
-    final, hist, losses = optimise_batch(initial_raw_batch(), scene)
+    final, hist, losses = optimise_batch(initial_guesses(scene), scene)
     assert final.shape == (N, 2) and hist.shape == (N, N_ITERS, 2) and losses.shape == (N, N_ITERS)
     assert min(float(loss_fn(r, scene)) for r in final) < 1e-3
 
@@ -112,31 +128,36 @@ def test_optimise_batch_converges():
 
 def test_solve_ignores_a_wall_that_is_not_in_the_way():
     wall_off = (41.0, 2.0, 12.0, 0.0)
-    f_off, hist, losses = solve(initial_raw_batch(), make_scene((84.0, 15.5), wall=wall_off))
+    f_off, hist, losses = solve(make_scene((84.0, 15.5), wall=wall_off))
     assert hist.shape == (N, 2 * N_ITERS, 2) and losses.shape == (N, 2 * N_ITERS)
-    f_low, _, _ = solve(initial_raw_batch(), make_scene((84.0, 15.5), wall=(41.0, 2.0, 12.0, 1.0)))
+    f_low, _, _ = solve(make_scene((84.0, 15.5), wall=(41.0, 2.0, 12.0, 1.0)))
     assert jnp.allclose(f_off, f_low, atol=1e-4)
 
 
 def test_solve_clears_a_blocking_wall():
     scene = make_scene((60.0, 5.0), wall=WALL)
-    assert all(hits(solve(initial_raw_batch(), scene)[0], scene))
+    assert all(hits(solve(scene)[0], scene))
 
 
 def test_solve_hits_a_moving_target():
     scene = make_scene((50.0, 5.0), target_vel=(-5.0, 2.0))
-    assert any(hits(solve(initial_raw_batch(), scene)[0], scene))
+    assert any(hits(solve(scene)[0], scene))
+
+
+def test_solve_lobs_a_wall_in_front_of_a_receding_target():
+    scene = make_scene((70.0, 5.0), target_vel=(8.0, 0.0), wall=WALL)
+    assert any(hits(solve(scene)[0], scene))
 
 
 def test_solve_hits_with_drag():
     scene = make_scene((50.0, 5.0), drag=0.015)
-    assert any(hits(solve(initial_raw_batch(), scene)[0], scene))
+    assert any(hits(solve(scene)[0], scene))
 
 
 def test_changing_the_scene_does_not_recompile():
-    solve(initial_raw_batch(), make_scene((40.0, 5.0)))
+    solve(make_scene((40.0, 5.0)))
     before = solve._cache_size()
-    solve(initial_raw_batch(), make_scene((70.0, 9.0), (4.0, -1.0), (50.0, 2.0, 8.0, 1.0), 0.015))
+    solve(make_scene((70.0, 9.0), (4.0, -1.0), (50.0, 2.0, 8.0, 1.0), 0.015))
     assert solve._cache_size() == before
 
 

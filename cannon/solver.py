@@ -10,19 +10,17 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from cannon.physics import DT, MAX_SPEED, N_STEPS, launch_to_raw, simulate
+from cannon.physics import DT, GRAVITY, MAX_SPEED, N_STEPS, launch_to_raw, simulate
 
 N_ITERS = 300           # Adam steps per phase
 LEARNING_RATE = 0.1
 WALL_WEIGHT = 10.0      # wall penalty vs miss distance
 WALL_SMOOTH = 0.3       # m; softness of the wall's sides, so the penalty has useful gradients
 BLOCKED_TOL = 1e-6      # wall penalty above which an arc counts as going through the wall
+GUESS_SPEED_MARGIN = 1.1  # starting speed vs the drag-free minimum; higher lobs outlast N_STEPS
+N_ARCS = 2              # a flat and a lobbed arc
 
 DEFAULT_WALL = (30.0, 2.0, 15.0, 0.0)
-
-# Starting guesses as (angle in degrees, fraction of MAX_SPEED): one shallow, one steep,
-# so the batch tends to find both arcs through the target.
-INITIAL_GUESSES = [(25.0, 0.6), (70.0, 0.6)]
 
 
 class Scene(NamedTuple):
@@ -49,9 +47,19 @@ def target_path(scene):
     return scene.target + t[:, None] * scene.target_vel
 
 
-def initial_raw_batch():
-    """``INITIAL_GUESSES`` as raw params, shape ``(n_guesses, 2)``."""
-    return jnp.stack([launch_to_raw(jnp.deg2rad(a), f * MAX_SPEED) for a, f in INITIAL_GUESSES])
+def initial_guesses(scene):
+    """Starting raw params, shape ``(N_ARCS, 2)``: the flat and the lobbed drag-free arcs through
+    the target's launch position.
+
+    Speed is ``GUESS_SPEED_MARGIN`` times the drag-free minimum ``sqrt(g·(y + |p|))``; the two
+    angles solve ``tan θ = (v² ∓ sqrt(v⁴ − g(g·x² + 2y·v²))) / (g·x)``. The optimiser only has to
+    correct for drag, target motion and the wall, whatever ``MAX_SPEED`` is.
+    """
+    x, y = scene.target
+    v = jnp.minimum(GUESS_SPEED_MARGIN * jnp.sqrt(GRAVITY * (y + jnp.hypot(x, y))), 0.95 * MAX_SPEED)
+    root = jnp.sqrt(jax.nn.relu(v**4 - GRAVITY * (GRAVITY * x**2 + 2 * y * v**2)))  # relu: v capped below the minimum
+    angles = jnp.arctan((v**2 + jnp.array([-root, root])) / (GRAVITY * x))
+    return jax.vmap(launch_to_raw, in_axes=(0, None))(jnp.clip(angles, 0.02, 1.55), v)
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +162,8 @@ def optimise_batch(raw0_batch, scene):
 
 
 @jax.jit
-def solve(raw0_batch, scene):
-    """Find launch params that hit the target from each starting guess, avoiding the wall.
+def solve(scene):
+    """Find launch params that hit the target from each of :func:`initial_guesses`, avoiding the wall.
 
     Two phases, so the wall only changes arcs it actually blocks:
       1. optimise with the wall off -> the arcs the target alone would give;
@@ -169,7 +177,8 @@ def solve(raw0_batch, scene):
     (n, 2), (n, 2 * N_ITERS, 2), (n, 2 * N_ITERS). Unblocked arcs repeat their phase-1
     result through phase 2.
     """
-    free_final, free_hist, free_loss = optimise_batch(raw0_batch, scene._replace(wall=scene.wall.at[3].set(0.0)))
+    no_wall = scene._replace(wall=scene.wall.at[3].set(0.0))
+    free_final, free_hist, free_loss = optimise_batch(initial_guesses(scene), no_wall)
 
     _, penalty = jax.vmap(shot_terms, in_axes=(0, None))(free_final, scene)
     blocked = penalty > BLOCKED_TOL

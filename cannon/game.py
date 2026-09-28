@@ -12,7 +12,7 @@ import numpy as np
 from matplotlib.patches import FancyArrowPatch, Rectangle
 
 from cannon.physics import CANNON_POS, simulate, to_launch
-from cannon.solver import DEFAULT_WALL, INITIAL_GUESSES, initial_raw_batch, make_scene, solve, target_path
+from cannon.solver import DEFAULT_WALL, N_ARCS, make_scene, solve, target_path
 
 HIT_RADIUS = 1.0        # m
 BALL_SPEEDUP = 3        # trajectory points advanced per animation frame
@@ -75,7 +75,6 @@ def visible(traj):
 
 class CannonGame:
     def __init__(self):
-        self.raw0 = initial_raw_batch()
         self.sim_snapshots = jax.jit(jax.vmap(jax.vmap(simulate, in_axes=(0, None)), in_axes=(0, None)))
         self.target = None
         self.target_vel = np.zeros(2)
@@ -106,7 +105,7 @@ class CannonGame:
                                          lw=1.5, zorder=6, visible=False)
         ax.add_patch(self.vel_arrow)
         self.arcs = [ax.plot([], [], "-", color=ARC_COLORS[a % len(ARC_COLORS)], lw=1.5, alpha=0.5, zorder=3)[0]
-                     for a in range(len(INITIAL_GUESSES))]
+                     for a in range(N_ARCS)]
         self.ghosts = []
         self.ball, = ax.plot([], [], "o", ms=9, color="black", zorder=7)
         self.boom, = ax.plot([], [], "*", ms=35, color="gold", mec="red", zorder=8)
@@ -161,7 +160,7 @@ class CannonGame:
     def solve(self):
         scene = self.scene()
         t0 = time.perf_counter()
-        final, hist, losses = solve(self.raw0, scene)
+        final, hist, losses = solve(scene)
         final.block_until_ready()          # JAX dispatches asynchronously; wait before reading the clock
         ms = 1000 * (time.perf_counter() - t0)
         return scene, np.asarray(final), np.asarray(hist), np.asarray(losses), ms
@@ -358,9 +357,9 @@ class CannonGame:
 def main():
     # The first call compiles; later calls with any target, wall or drag reuse the compiled program.
     t0 = time.perf_counter()
-    solve(initial_raw_batch(), make_scene((40.0, 5.0)))[0].block_until_ready()
+    solve(make_scene((40.0, 5.0)))[0].block_until_ready()
     t1 = time.perf_counter()
-    solve(initial_raw_batch(), make_scene((50.0, 9.0), (3.0, 0.0), drag=0.005))[0].block_until_ready()
+    solve(make_scene((50.0, 9.0), (3.0, 0.0), drag=0.005))[0].block_until_ready()
     t2 = time.perf_counter()
     print(f"solve: first call (compile + run) {1000 * (t1 - t0):.0f} ms, later calls {1000 * (t2 - t1):.1f} ms")
     game = CannonGame()   # keep a reference: matplotlib holds only weak refs to event handlers

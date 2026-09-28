@@ -48,8 +48,9 @@ is never cut short (fixed shapes keep it compilable); the losses decide what cou
 **Optimiser.** Hand-written Adam. Angle and speed have very different gradient scales, and
 Adam normalises each parameter's step by its own.
 
-**Solve.** Several starting guesses (shallow and steep) are optimised at once with `vmap`, so
-the solver usually finds both arcs through the target. The solve runs in two phases:
+**Solve.** Two starting guesses, the flat and the lobbed drag-free arcs through the target
+(closed form), are optimised at once with `vmap`. Gradient descent then only corrects for drag,
+target motion and the wall, and each guess stays on its own branch. The solve runs in two phases:
 1. optimise with the wall off;
 2. only for arcs that go through the wall, keep optimising with it on, warm-started from phase 1.
 
@@ -77,8 +78,6 @@ learning/           earlier exercises this grew out of (not part of the game)
 
 ## Roadmap
 
-- **More starting guesses**: `vmap` makes extra arcs nearly free, and more of them give the
-  lowest-speed choice more options.
 - **Wall-weight annealing**: ramp the wall weight from 0 over the iterations (`scan` with
   `xs=jnp.arange(N_ITERS)`); in early tests this helped stuck arcs at no extra cost.
 - **Wind**: a constant horizontal acceleration: one more `Scene` field.
