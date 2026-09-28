@@ -27,8 +27,8 @@ INITIAL_GUESSES = [(25.0, 0.6), (70.0, 0.6)]
 
 class Scene(NamedTuple):
     """Everything the solver aims against. Build it with :func:`make_scene`."""
-    target: jax.Array       # (2,)  m, position at launch
-    target_vel: jax.Array   # (2,)  m/s, constant
+    target: jax.Array       # (2,)  m, target position at launch
+    target_vel: jax.Array   # (2,)  m/s, target velocity at launch, constant
     wall: jax.Array         # (4,)  [x_center, thickness, height, enabled]; enabled is 0.0 or 1.0
     drag: jax.Array         # ()    1/m, see physics.acceleration
 
@@ -70,12 +70,9 @@ def closest_approach(traj, target_traj):
 
     ``index`` is the timestep where the closest segment starts.
     """
-    # TODO(you): work in the target's frame. Within one timestep both the ball and the target move
-    # in a straight line, so the ball's position RELATIVE to the target does too: the relative
-    # path is a polyline, and a hit means it passes through the origin. point_segment_sq_dist
-    # already measures that. A static target must give the same answer as the old miss loss.
-    # Tests: tests/test_solver.py -k closest_approach
-    raise NotImplementedError
+    rel_traj = traj - target_traj
+    sq_dists = jax.vmap(point_segment_sq_dist, in_axes=(0, 0, None))(rel_traj[:-1], rel_traj[1:], jnp.zeros(2))
+    return jnp.min(sq_dists), jnp.argmin(sq_dists)
 
 
 def wall_penalty(traj, wall, until):
@@ -90,10 +87,8 @@ def wall_penalty(traj, wall, until):
     left, right = x_center - thickness / 2, x_center + thickness / 2
     inside = jax.nn.sigmoid((x - left) / WALL_SMOOTH) * jax.nn.sigmoid((right - x) / WALL_SMOOTH)
     depth = jax.nn.relu(height - y)
-    # TODO(you): only timesteps 0..until count. `until` is a traced integer, so no slicing
-    # (traj[:until] needs a concrete length): build a 0/1 mask instead.
-    # Tests: tests/test_solver.py -k wall
-    raise NotImplementedError
+    mask = jnp.arange(traj.shape[0]) <= until
+    return enabled * jnp.sum(inside * depth**2 * mask)
 
 
 def shot_terms(raw, scene):
