@@ -16,8 +16,11 @@ python -m pytest                # tests
 | Input        | Action                                         |
 |--------------|------------------------------------------------|
 | left-drag    | place the target; fires on release             |
+| shift-drag   | set the target's velocity (arrow = 1 s travel) |
 | right-drag   | move the wall (x = position, y = height)       |
 | `w`          | wall on / off                                  |
+| `d`          | air drag: off / light / heavy                  |
+| `v`          | stop the target                                |
 | `p`          | live aiming while dragging                     |
 | `r`          | replay the optimisation before firing          |
 | `h`          | help                                           |
@@ -28,14 +31,19 @@ python -m pytest                # tests
 `angle = (π/2)·σ(a)` and `speed = v_max·σ(s)`. The sigmoid keeps every iterate a valid launch,
 so no constraint handling is needed.
 
-**Simulation.** `lax.scan` steps the ball forward for a fixed number of timesteps. The flight
+**Simulation.** Gravity plus quadratic air drag, `a = g − k|v|v`, stepped by `lax.scan` with a
+second-order integrator (forward Euler drifts 0.2–0.6 m over a flight under drag). The flight
 is never cut short (fixed shapes keep it compilable); the losses decide what counts.
 
 **Loss.**
-- *Miss*: squared distance from the target to the trajectory, treating the trajectory as a
-  polyline, so a target between two timesteps still scores ~0.
-- *Wall*: `Σ inside(x)·relu(h − y)²`, where `inside` is a smooth 0..1 mask over the wall's
-  width. A hard mask would have zero gradient; the smooth one points the optimiser out of the wall.
+- *Miss*: the closest the ball gets to the target in space *and* time. The target moves at
+  constant velocity, so in the target's frame the ball's relative path is still a polyline, and
+  a hit means it passes through the origin. Measuring point-to-segment distance (not
+  point-to-point) means a hit between two timesteps still scores ~0. A static target is just
+  velocity 0; flight time never has to become a parameter.
+- *Wall*: `Σ inside(x)·relu(h − y)²` over the flight *before* the closest approach. `inside` is a
+  smooth 0..1 mask over the wall's width: a hard mask would have zero gradient, the smooth one
+  points the optimiser out of the wall.
 
 **Optimiser.** Hand-written Adam. Angle and speed have very different gradient scales, and
 Adam normalises each parameter's step by its own.
@@ -49,8 +57,13 @@ This way a wall that ends up under the arcs doesn't change the answer, and arcs 
 stuck inside the wall. Under `vmap` there's no per-arc branching, so phase 2 runs for every
 arc and `jnp.where` picks the result.
 
-**No recompilation.** The target and wall are passed as array *values* (the wall's on/off
-flag is a float), so moving or toggling them reuses the compiled program.
+**Choosing the shot.** The loss only asks "does it hit?". Which hitting arc to fire is a separate
+decision: the one with the lowest launch speed. A speed penalty in the loss would mix units
+(m² vs (m/s)²) and pull the ball off the target.
+
+**No recompilation.** Everything the player changes lives in a `Scene` pytree of float32 arrays
+(target, target velocity, wall, drag; the wall's on/off flag is a float), so any change is new
+data for the same compiled program. A test checks this.
 
 ## Layout
 
@@ -64,14 +77,9 @@ learning/           earlier exercises this grew out of (not part of the game)
 
 ## Roadmap
 
-- **Air drag** (`a = g − k|v|v`): needs a higher-order integrator. With drag, the cheapest
-  arc drops below 45° and steep lobs become expensive, so choosing the lowest-speed hitting
-  arc becomes a real decision.
-- **Moving target**: measure the miss in the target's frame (`ball(t) − target(t)`). Both move
-  linearly within a timestep, so the existing point-to-segment distance still applies and no
-  flight-time parameter is needed.
-- **Wall timing**: penalise only the flight *before* the closest approach, instead of the
-  current "wall is left of the target" rule (which breaks once the target moves).
+- **More starting guesses**: `vmap` makes extra arcs nearly free, and more of them give the
+  lowest-speed choice more options.
 - **Wall-weight annealing**: ramp the wall weight from 0 over the iterations (`scan` with
   `xs=jnp.arange(N_ITERS)`); in early tests this helped stuck arcs at no extra cost.
-- **Wind**: a constant horizontal acceleration, passed in as data like the wall.
+- **Wind**: a constant horizontal acceleration: one more `Scene` field.
+- **Accelerating targets**: `target_path` is the only place that assumes constant velocity.

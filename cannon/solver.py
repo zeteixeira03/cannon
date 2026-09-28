@@ -1,14 +1,16 @@
 """Aiming as optimisation: a differentiable loss, Adam, and a batched, compiled solve.
 
-The wall is a float array ``[x_center, thickness, height, enabled]``. Keeping
-``enabled`` as a float value (not a Python bool) means toggling the wall changes data,
-not the program, so the compiled solver is reused.
+Everything the player can change lives in a :class:`Scene`, a pytree of arrays. The
+solver is compiled once; changing the target, the wall or the drag changes data, not
+the program, so it never recompiles.
 """
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
-from cannon.physics import MAX_SPEED, launch_to_raw, simulate
+from cannon.physics import DT, MAX_SPEED, N_STEPS, launch_to_raw, simulate
 
 N_ITERS = 300           # Adam steps per phase
 LEARNING_RATE = 0.1
@@ -16,11 +18,35 @@ WALL_WEIGHT = 10.0      # wall penalty vs miss distance
 WALL_SMOOTH = 0.3       # m; softness of the wall's sides, so the penalty has useful gradients
 BLOCKED_TOL = 1e-6      # wall penalty above which an arc counts as going through the wall
 
-DEFAULT_WALL = jnp.array([30.0, 2.0, 15.0, 0.0])
+DEFAULT_WALL = (30.0, 2.0, 15.0, 0.0)
 
 # Starting guesses as (angle in degrees, fraction of MAX_SPEED): one shallow, one steep,
 # so the batch tends to find both arcs through the target.
 INITIAL_GUESSES = [(25.0, 0.6), (70.0, 0.6)]
+
+
+class Scene(NamedTuple):
+    """Everything the solver aims against. Build it with :func:`make_scene`."""
+    target: jax.Array       # (2,)  m, position at launch
+    target_vel: jax.Array   # (2,)  m/s, constant
+    wall: jax.Array         # (4,)  [x_center, thickness, height, enabled]; enabled is 0.0 or 1.0
+    drag: jax.Array         # ()    1/m, see physics.acceleration
+
+
+def make_scene(target, target_vel=(0.0, 0.0), wall=DEFAULT_WALL, drag=0.0):
+    """A :class:`Scene` with every field as float32.
+
+    Fixed dtypes and shapes matter: ``jit`` recompiles when they change, e.g. a Python
+    float in one call and a float32 array in the next.
+    """
+    f32 = lambda x: jnp.asarray(x, jnp.float32)
+    return Scene(f32(target), f32(target_vel), f32(wall), f32(drag))
+
+
+def target_path(scene):
+    """Target position at each simulation time, aligned row by row with :func:`simulate`."""
+    t = DT * jnp.arange(1, N_STEPS + 1)
+    return scene.target + t[:, None] * scene.target_vel
 
 
 def initial_raw_batch():
@@ -39,36 +65,47 @@ def point_segment_sq_dist(a, b, p):
     return jnp.sum((p - (a + t * ab)) ** 2)
 
 
-def miss_loss(traj, target):
-    """Squared distance from ``target`` to the closest point of the trajectory.
+def closest_approach(traj, target_traj):
+    """Closest the ball gets to the target in space AND time: ``(squared_distance, index)``.
 
-    The trajectory is treated as a polyline, not as separate points, so a target that
-    lies between two timesteps still gets a loss of ~0.
+    ``index`` is the timestep where the closest segment starts.
     """
-    dists = jax.vmap(point_segment_sq_dist, in_axes=(0, 0, None))(traj[:-1], traj[1:], target)
-    return jnp.min(dists)
+    # TODO(you): work in the target's frame. Within one timestep both the ball and the target move
+    # in a straight line, so the ball's position RELATIVE to the target does too: the relative
+    # path is a polyline, and a hit means it passes through the origin. point_segment_sq_dist
+    # already measures that. A static target must give the same answer as the old miss loss.
+    # Tests: tests/test_solver.py -k closest_approach
+    raise NotImplementedError
 
 
-def wall_penalty(traj, target, wall):
-    """How deep the trajectory goes through the wall: ``sum(inside * depth²)``; 0 if it clears.
+def wall_penalty(traj, wall, until):
+    """How deep the flight up to timestep ``until`` goes through the wall: ``Σ inside·depth²``.
 
     ``inside`` is a smooth 0..1 mask over the wall's width, so the gradient points out of the wall
-    (a hard mask would have zero gradient). The wall only counts when it is on and stands between
-    the cannon and the target.
+    (a hard mask would have zero gradient). Points after ``until`` (the impact) don't count, and
+    neither does a disabled wall.
     """
     x_center, thickness, height, enabled = wall
     x, y = traj[:, 0], traj[:, 1]
     left, right = x_center - thickness / 2, x_center + thickness / 2
     inside = jax.nn.sigmoid((x - left) / WALL_SMOOTH) * jax.nn.sigmoid((right - x) / WALL_SMOOTH)
     depth = jax.nn.relu(height - y)
-    active = enabled * (x_center < target[0])
-    return active * jnp.sum(inside * depth**2)
+    # TODO(you): only timesteps 0..until count. `until` is a traced integer, so no slicing
+    # (traj[:until] needs a concrete length): build a 0/1 mask instead.
+    # Tests: tests/test_solver.py -k wall
+    raise NotImplementedError
 
 
-def loss_fn(raw, target, wall):
-    """Miss distance plus weighted wall penalty for launch params ``raw``."""
-    traj = simulate(raw)
-    return miss_loss(traj, target) + WALL_WEIGHT * wall_penalty(traj, target, wall)
+def shot_terms(raw, scene):
+    """``(miss, wall)`` loss terms for launch params ``raw``."""
+    traj = simulate(raw, scene.drag)
+    miss, impact = closest_approach(traj, target_path(scene))
+    return miss, wall_penalty(traj, scene.wall, impact)
+
+
+def loss_fn(raw, scene):
+    miss, wall = shot_terms(raw, scene)
+    return miss + WALL_WEIGHT * wall
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +134,7 @@ def adam_update(raw, grads, opt_state, lr=LEARNING_RATE, b1=0.9, b2=0.999, eps=1
 # Solve
 # ---------------------------------------------------------------------------
 
-def optimise(raw0, target, wall):
+def optimise(raw0, scene):
     """``N_ITERS`` Adam steps on ``loss_fn`` from ``raw0``, as a single ``lax.scan``.
 
     Returns ``(final_raw, raw_history, loss_history)`` with shapes (2,), (N_ITERS, 2), (N_ITERS,).
@@ -106,7 +143,7 @@ def optimise(raw0, target, wall):
 
     def body(carry, _):
         raw, opt_state = carry
-        loss, grads = loss_and_grad(raw, target, wall)
+        loss, grads = loss_and_grad(raw, scene)
         raw, opt_state = adam_update(raw, grads, opt_state)
         return (raw, opt_state), (raw, loss)
 
@@ -116,14 +153,14 @@ def optimise(raw0, target, wall):
 
 
 @jax.jit
-def optimise_batch(raw0_batch, target, wall):
+def optimise_batch(raw0_batch, scene):
     """:func:`optimise` from each row of ``raw0_batch``; every output gains a leading batch axis."""
-    return jax.vmap(optimise, in_axes=(0, None, None))(raw0_batch, target, wall)
+    return jax.vmap(optimise, in_axes=(0, None))(raw0_batch, scene)
 
 
 @jax.jit
-def solve(raw0_batch, target, wall):
-    """Find launch params that hit ``target`` from each starting guess, avoiding the wall.
+def solve(raw0_batch, scene):
+    """Find launch params that hit the target from each starting guess, avoiding the wall.
 
     Two phases, so the wall only changes arcs it actually blocks:
       1. optimise with the wall off -> the arcs the target alone would give;
@@ -137,14 +174,14 @@ def solve(raw0_batch, target, wall):
     (n, 2), (n, 2 * N_ITERS, 2), (n, 2 * N_ITERS). Unblocked arcs repeat their phase-1
     result through phase 2.
     """
-    free_final, free_hist, free_loss = optimise_batch(raw0_batch, target, wall.at[3].set(0.0))
+    free_final, free_hist, free_loss = optimise_batch(raw0_batch, scene._replace(wall=scene.wall.at[3].set(0.0)))
 
-    free_traj = jax.vmap(simulate)(free_final)
-    blocked = jax.vmap(wall_penalty, in_axes=(0, None, None))(free_traj, target, wall) > BLOCKED_TOL
+    _, penalty = jax.vmap(shot_terms, in_axes=(0, None))(free_final, scene)
+    blocked = penalty > BLOCKED_TOL
 
     # Under jit and vmap there is no per-arc branching: phase 2 runs for every arc and
     # jnp.where selects the result.
-    wall_final, wall_hist, wall_loss = optimise_batch(free_final, target, wall)
+    wall_final, wall_hist, wall_loss = optimise_batch(free_final, scene)
     final = jnp.where(blocked[:, None], wall_final, free_final)
     phase2_hist = jnp.where(blocked[:, None, None], wall_hist, free_final[:, None, :])
     phase2_loss = jnp.where(blocked[:, None], wall_loss, free_loss[:, -1:])

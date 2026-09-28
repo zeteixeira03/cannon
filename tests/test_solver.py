@@ -2,14 +2,34 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from cannon.game import analyse_shot
-from cannon.physics import launch_to_raw, simulate
-from cannon.solver import (DEFAULT_WALL, INITIAL_GUESSES, LEARNING_RATE, N_ITERS, adam_init, adam_update,
-                           initial_raw_batch, loss_fn, miss_loss, optimise_batch, point_segment_sq_dist, solve,
-                           wall_penalty)
+from cannon.game import analyse_shot, choose_arc
+from cannon.physics import DT, N_STEPS, launch_to_raw, simulate
+from cannon.solver import (INITIAL_GUESSES, LEARNING_RATE, N_ITERS, adam_init, adam_update, closest_approach,
+                           initial_raw_batch, loss_fn, make_scene, optimise_batch, point_segment_sq_dist, solve,
+                           target_path, wall_penalty)
 
 N = len(INITIAL_GUESSES)
+WALL = jnp.array([30.0, 2.0, 15.0, 1.0])
+TIMES = DT * jnp.arange(1, N_STEPS + 1)
 
+
+def low_shot():
+    """20°, 30 m/s: passes x = 30 at about 2 m high, so it goes through ``WALL``."""
+    return simulate(launch_to_raw(jnp.deg2rad(20.0), 30.0))
+
+
+def moving_target_through(point, i, vel):
+    """Target path with velocity ``vel`` that is at ``point`` at timestep ``i``."""
+    return point + (TIMES - TIMES[i])[:, None] * jnp.asarray(vel)
+
+
+def hits(final, scene):
+    tpath = np.asarray(target_path(scene))
+    return [analyse_shot(simulate(r, scene.drag), tpath, np.asarray(scene.wall), np.asarray(scene.target))["hit"]
+            for r in final]
+
+
+# ----- loss pieces --------------------------------------------------------
 
 def test_point_segment_sq_dist():
     a, b = jnp.array([0.0, 0.0]), jnp.array([10.0, 0.0])
@@ -19,25 +39,60 @@ def test_point_segment_sq_dist():
     assert jnp.isfinite(point_segment_sq_dist(p, p, jnp.array([4.0, 5.0])))         # zero-length segment
 
 
-def test_miss_loss_between_timesteps_is_zero():
-    traj = simulate(launch_to_raw(jnp.pi / 4, 20.0))
-    assert miss_loss(traj, 0.5 * (traj[123] + traj[124])) < 1e-4
+def test_closest_approach_static_target_between_timesteps():
+    traj = low_shot()
+    target = 0.5 * (traj[123] + traj[124])
+    d2, i = closest_approach(traj, jnp.broadcast_to(target, traj.shape))
+    assert d2 < 1e-4 and i == 123
 
 
-def test_wall_penalty():
-    target = jnp.array([60.0, 5.0])
-    traj = simulate(launch_to_raw(jnp.deg2rad(20.0), 30.0))    # low shot through a tall wall
-    wall_on = jnp.array([30.0, 2.0, 15.0, 1.0])
-    assert wall_penalty(traj, target, wall_on) > 0
-    assert wall_penalty(traj, target, wall_on.at[3].set(0.0)) == 0
-    assert wall_penalty(traj, target, jnp.array([80.0, 2.0, 15.0, 1.0])) == 0     # behind the target
+def test_closest_approach_static_target_off_the_path():
+    traj = low_shot()
+    target = traj[100] + jnp.array([0.0, 3.0])
+    d2, _ = closest_approach(traj, jnp.broadcast_to(target, traj.shape))
+    geometric = jnp.min(jax.vmap(point_segment_sq_dist, in_axes=(0, 0, None))(traj[:-1], traj[1:], target))
+    assert jnp.allclose(d2, geometric, rtol=1e-4)                # a static target reduces to the old loss
+
+
+def test_closest_approach_moving_target_on_time():
+    traj = low_shot()
+    d2, i = closest_approach(traj, moving_target_through(traj[150], 150, (-6.0, 2.0)))
+    assert d2 < 1e-4 and i in (149, 150)
+
+
+def test_closest_approach_moving_target_late_is_a_miss():
+    # The target crosses the ball's path, but 1 s after the ball has passed.
+    traj = low_shot()
+    d2, _ = closest_approach(traj, moving_target_through(traj[100], 150, (-6.0, 0.0)))
+    assert d2 > 1.0
+
+
+def test_wall_penalty_counts_only_the_flight_before_impact():
+    traj = low_shot()
+    assert wall_penalty(traj, WALL, N_STEPS - 1) > 0
+    assert wall_penalty(traj, WALL.at[3].set(0.0), N_STEPS - 1) == 0
+    before_wall = int(jnp.argmax(traj[:, 0] > 20.0))            # impact at x ≈ 20, left of the wall
+    assert wall_penalty(traj, WALL, before_wall) < 1e-9          # ~0: the smooth mask only has tails
+
+
+def test_wall_counts_for_a_target_that_starts_before_it():
+    # The target starts left of the wall but is hit to the right of it: the ball goes through
+    # the wall, so the penalty must count. (A "wall left of the target" rule would miss this.)
+    traj = low_shot()
+    i = int(jnp.argmax(traj[:, 0] > 45.0))
+    scene = make_scene(target=(20.0, 0.0), target_vel=((traj[i, 0] - 20.0) / TIMES[i], traj[i, 1] / TIMES[i]),
+                       wall=WALL)
+    d2, impact = closest_approach(traj, target_path(scene))
+    assert d2 < 1e-3 and wall_penalty(traj, scene.wall, impact) > 0
 
 
 def test_wall_gradient_raises_the_angle():
     raw = launch_to_raw(jnp.deg2rad(20.0), 30.0)
-    g = jax.grad(loss_fn)(raw, jnp.array([60.0, 5.0]), jnp.array([30.0, 2.0, 15.0, 1.0]))
+    g = jax.grad(loss_fn)(raw, make_scene((60.0, 5.0), wall=WALL))
     assert jnp.all(jnp.isfinite(g)) and g[0] < 0
 
+
+# ----- optimiser ----------------------------------------------------------
 
 def test_adam_first_step_is_lr_for_every_param():
     raw = jnp.array([1.0, -2.0])
@@ -47,22 +102,45 @@ def test_adam_first_step_is_lr_for_every_param():
 
 
 def test_optimise_batch_converges():
-    target = jnp.array([40.0, 5.0])
-    final, hist, losses = optimise_batch(initial_raw_batch(), target, DEFAULT_WALL)
+    scene = make_scene((40.0, 5.0))
+    final, hist, losses = optimise_batch(initial_raw_batch(), scene)
     assert final.shape == (N, 2) and hist.shape == (N, N_ITERS, 2) and losses.shape == (N, N_ITERS)
-    assert min(float(miss_loss(simulate(r), target)) for r in final) < 1e-3
+    assert min(float(loss_fn(r, scene)) for r in final) < 1e-3
 
+
+# ----- solve --------------------------------------------------------------
 
 def test_solve_ignores_a_wall_that_is_not_in_the_way():
-    target = jnp.array([84.0, 15.5])
-    wall_off = jnp.array([41.0, 2.0, 12.0, 0.0])
-    f_off, hist, losses = solve(initial_raw_batch(), target, wall_off)
+    wall_off = (41.0, 2.0, 12.0, 0.0)
+    f_off, hist, losses = solve(initial_raw_batch(), make_scene((84.0, 15.5), wall=wall_off))
     assert hist.shape == (N, 2 * N_ITERS, 2) and losses.shape == (N, 2 * N_ITERS)
-    f_low, _, _ = solve(initial_raw_batch(), target, wall_off.at[3].set(1.0))   # under both final arcs
+    f_low, _, _ = solve(initial_raw_batch(), make_scene((84.0, 15.5), wall=(41.0, 2.0, 12.0, 1.0)))
     assert jnp.allclose(f_off, f_low, atol=1e-4)
 
 
 def test_solve_clears_a_blocking_wall():
-    target, wall = jnp.array([60.0, 5.0]), jnp.array([30.0, 2.0, 15.0, 1.0])
-    final, _, _ = solve(initial_raw_batch(), target, wall)
-    assert all(analyse_shot(simulate(r), np.asarray(target), np.asarray(wall))["hit"] for r in final)
+    scene = make_scene((60.0, 5.0), wall=WALL)
+    assert all(hits(solve(initial_raw_batch(), scene)[0], scene))
+
+
+def test_solve_hits_a_moving_target():
+    scene = make_scene((50.0, 5.0), target_vel=(-5.0, 2.0))
+    assert any(hits(solve(initial_raw_batch(), scene)[0], scene))
+
+
+def test_solve_hits_with_drag():
+    scene = make_scene((50.0, 5.0), drag=0.015)
+    assert any(hits(solve(initial_raw_batch(), scene)[0], scene))
+
+
+def test_changing_the_scene_does_not_recompile():
+    solve(initial_raw_batch(), make_scene((40.0, 5.0)))
+    before = solve._cache_size()
+    solve(initial_raw_batch(), make_scene((70.0, 9.0), (4.0, -1.0), (50.0, 2.0, 8.0, 1.0), 0.015))
+    assert solve._cache_size() == before
+
+
+def test_choose_arc_prefers_the_cheapest_hit():
+    hit, miss = dict(hit=True, blocked=False, miss=0.1), dict(hit=False, blocked=False, miss=0.5)
+    assert choose_arc([hit, hit], [30.0, 20.0]) == 1
+    assert choose_arc([miss, hit], [10.0, 40.0]) == 1
